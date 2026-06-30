@@ -2280,7 +2280,13 @@ static eg_result eg_write_resources_to_image(
         resource_raw_size = section.raw_size;
         memset(image + resource_raw_ptr, 0, resource_raw_size);
         memcpy(image + resource_raw_ptr, resource_data, resource_size);
-        eg_write_u32(image, section.header_offset + 8u, (uint32_t)resource_size);
+        eg_write_u32(
+            image,
+            section.header_offset + 8u,
+            section.virtual_size > (uint32_t)resource_size
+                ? section.virtual_size
+                : (uint32_t)resource_size
+        );
     } else {
         uint16_t new_count;
         size_t new_header_offset;

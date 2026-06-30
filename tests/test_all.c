@@ -401,6 +401,37 @@ static int parse_resources(const unsigned char *data, size_t size, test_resource
     return parse_resource_dir(data, size, base, resource_size, 0u, 0, 0u, 0u, sections, sections_count, list);
 }
 
+static int get_named_section_virtual_size(
+    const unsigned char *data,
+    size_t size,
+    const char *name,
+    uint32_t *out_virtual_size
+) {
+    uint32_t nt;
+    uint16_t sections_count;
+    uint16_t optional_size;
+    uint32_t section_table;
+    size_t i;
+    if (size < 0x100u || read_u16(data, size, 0u) != 0x5a4du) return 0;
+    nt = read_u32(data, size, 0x3cu);
+    if (nt + 24u > size || memcmp(data + nt, "PE\0\0", 4u) != 0) return 0;
+    sections_count = read_u16(data, size, nt + 6u);
+    optional_size = read_u16(data, size, nt + 20u);
+    section_table = nt + 24u + optional_size;
+    if (section_table + (uint32_t)sections_count * 40u > size) return 0;
+    for (i = 0u; i < sections_count; i++) {
+        size_t off = section_table + i * 40u;
+        char section_name[9];
+        memset(section_name, 0, sizeof(section_name));
+        memcpy(section_name, data + off, 8u);
+        if (strcmp(section_name, name) == 0) {
+            *out_virtual_size = read_u32(data, size, off + 8u);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const test_resource *find_resource(const test_resource_list *list, uint32_t type, uint32_t name, uint32_t language) {
     size_t i;
     for (i = 0u; i < list->count; i++) {
@@ -599,6 +630,86 @@ static int test_pe64_raw_update(void) {
     CHECK(resource != NULL);
     resource = find_resource(&list, 14u, 1u, 1033u);
     CHECK(resource != NULL);
+    free(output.data);
+    return 0;
+}
+
+static int create_single_image_ico(size_t image_size, unsigned char fill, unsigned char **out_data, size_t *out_size) {
+    const size_t header_size = 6u + 16u;
+    unsigned char *data;
+    if (image_size == 0u || image_size > UINT32_MAX - header_size) return 0;
+    data = (unsigned char *)calloc(1u, header_size + image_size);
+    if (data == NULL) return 0;
+    write_u16(data, 0u, 0u);
+    write_u16(data, 2u, 1u);
+    write_u16(data, 4u, 1u);
+    data[6u] = 16u;
+    data[7u] = 16u;
+    data[8u] = 0u;
+    data[9u] = 0u;
+    write_u16(data, 10u, 1u);
+    write_u16(data, 12u, 32u);
+    write_u32(data, 14u, (uint32_t)image_size);
+    write_u32(data, 18u, (uint32_t)header_size);
+    memset(data + header_size, fill, image_size);
+    *out_data = data;
+    *out_size = header_size + image_size;
+    return 1;
+}
+
+static int write_icon_update(const char *input, const char *output, const unsigned char *ico, size_t ico_size) {
+    eg_pe_file *file = NULL;
+    eg_resource_update *update = NULL;
+    eg_result result;
+    result = eg_resource_update_create(&update);
+    CHECK(result == EG_OK);
+    result = eg_resource_update_set_icon_from_ico_data(update, 1u, 1033u, ico, ico_size);
+    CHECK(result == EG_OK);
+    result = eg_pe_open_file(input, &file);
+    CHECK(result == EG_OK);
+    result = eg_pe_write_file(file, update, output);
+    CHECK(result == EG_OK);
+    eg_pe_close(file);
+    eg_resource_update_destroy(update);
+    return 0;
+}
+
+static int test_icon_update_preserves_existing_resource_section_virtual_size(void) {
+    unsigned char *large_ico = NULL;
+    unsigned char *small_ico = NULL;
+    size_t large_ico_size = 0u;
+    size_t small_ico_size = 0u;
+    test_buffer seeded;
+    test_buffer output;
+    test_resource_list list;
+    const test_resource *group;
+    const test_resource *icon;
+    uint32_t seeded_virtual_size = 0u;
+    uint32_t output_virtual_size = 0u;
+    uint16_t icon_id;
+    memset(&seeded, 0, sizeof(seeded));
+    memset(&output, 0, sizeof(output));
+    CHECK(create_single_image_ico(8192u, 'L', &large_ico, &large_ico_size));
+    CHECK(create_single_image_ico(8u, 'S', &small_ico, &small_ico_size));
+    CHECK(create_minimal_pe("build/test-run/icon-base.exe", 1, 0x400u));
+    CHECK(write_icon_update("build/test-run/icon-base.exe", "build/test-run/icon-large.exe", large_ico, large_ico_size) == 0);
+    CHECK(read_file("build/test-run/icon-large.exe", &seeded));
+    CHECK(get_named_section_virtual_size(seeded.data, seeded.size, ".rsrc", &seeded_virtual_size));
+    CHECK(write_icon_update("build/test-run/icon-large.exe", "build/test-run/icon-small.exe", small_ico, small_ico_size) == 0);
+    CHECK(read_file("build/test-run/icon-small.exe", &output));
+    CHECK(get_named_section_virtual_size(output.data, output.size, ".rsrc", &output_virtual_size));
+    CHECK(output_virtual_size == seeded_virtual_size);
+    CHECK(parse_resources(output.data, output.size, &list));
+    group = find_resource(&list, 14u, 1u, 1033u);
+    CHECK(group != NULL);
+    CHECK(group->size == 20u);
+    icon_id = read_u16(group->data, group->size, 18u);
+    icon = find_resource(&list, 3u, icon_id, 1033u);
+    CHECK(icon != NULL);
+    CHECK(icon->size == 8u && memcmp(icon->data, "SSSSSSSS", 8u) == 0);
+    free(large_ico);
+    free(small_ico);
+    free(seeded.data);
     free(output.data);
     return 0;
 }
@@ -807,6 +918,7 @@ int main(void) {
     CHECK(write_test_assets() == 0);
     CHECK(test_cli_update_preserves_resources() == 0);
     CHECK(test_pe64_raw_update() == 0);
+    CHECK(test_icon_update_preserves_existing_resource_section_virtual_size() == 0);
     CHECK(test_large_update_moves_to_new_resource_section() == 0);
     CHECK(test_custom_io_ops_update_flow() == 0);
     CHECK(test_custom_io_error_cases() == 0);
