@@ -93,6 +93,7 @@ typedef struct eg_pe_info {
     size_t optional_offset;
     size_t section_table_offset;
     size_t number_sections_field;
+    size_t checksum_field;
     size_t size_image_field;
     size_t resource_rva_field;
     size_t resource_size_field;
@@ -197,6 +198,33 @@ static void eg_write_u32(unsigned char *data, size_t offset, uint32_t value) {
     data[offset + 1u] = (unsigned char)((value >> 8u) & 0xffu);
     data[offset + 2u] = (unsigned char)((value >> 16u) & 0xffu);
     data[offset + 3u] = (unsigned char)((value >> 24u) & 0xffu);
+}
+
+static uint32_t eg_compute_pe_checksum(const unsigned char *data, size_t size, size_t checksum_field) {
+    uint64_t sum = 0u;
+    size_t checksum_end = checksum_field + 4u;
+    size_t offset;
+    for (offset = 0u; offset + 1u < size; offset += 2u) {
+        unsigned int lo = offset >= checksum_field && offset < checksum_end ? 0u : data[offset];
+        unsigned int hi = offset + 1u >= checksum_field && offset + 1u < checksum_end ? 0u : data[offset + 1u];
+        sum += (uint16_t)(lo | (hi << 8u));
+        sum = (sum & 0xffffu) + (sum >> 16u);
+    }
+    if (offset < size && (offset < checksum_field || offset >= checksum_end)) {
+        sum += data[offset];
+    }
+    while ((sum >> 16u) != 0u) sum = (sum & 0xffffu) + (sum >> 16u);
+    sum += size;
+    return (uint32_t)sum;
+}
+
+static eg_result eg_update_pe_checksum(unsigned char *data, size_t size, size_t checksum_field) {
+    uint32_t checksum;
+    if (size > UINT32_MAX) return EG_ERROR_UNSUPPORTED_PE;
+    if (checksum_field > SIZE_MAX - 4u || checksum_field + 4u > size) return EG_ERROR_INVALID_PE;
+    checksum = eg_compute_pe_checksum(data, size, checksum_field);
+    eg_write_u32(data, checksum_field, checksum);
+    return EG_OK;
 }
 
 static uint32_t eg_align_u32(uint32_t value, uint32_t alignment) {
@@ -1149,6 +1177,7 @@ static eg_result eg_parse_pe_info(const unsigned char *data, size_t size, eg_pe_
     if (info->optional_size < data_dir_offset + 8u * 3u) return EG_ERROR_INVALID_PE;
     info->section_alignment = eg_read_u32(data, size, info->optional_offset + 32u);
     info->file_alignment = eg_read_u32(data, size, info->optional_offset + 36u);
+    info->checksum_field = info->optional_offset + 64u;
     info->size_image_field = info->optional_offset + 56u;
     info->size_of_image = eg_read_u32(data, size, info->size_image_field);
     info->size_of_headers = eg_read_u32(data, size, info->optional_offset + 60u);
@@ -2380,6 +2409,7 @@ eg_result eg_pe_write_file_with_io(
         result = eg_serialize_resources(&list, target_rva, &resource_data, &resource_size);
     }
     if (result == EG_OK) result = eg_write_resources_to_image(file, resource_data, resource_size, &image, &image_size);
+    if (result == EG_OK) result = eg_update_pe_checksum(image, image_size, file->info.checksum_field);
     if (result == EG_OK) result = eg_io_write_all(ops, output_path, image, image_size);
     free(resource_data);
     free(image);

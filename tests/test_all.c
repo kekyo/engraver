@@ -88,6 +88,52 @@ static void write_u32(unsigned char *data, size_t offset, uint32_t value) {
     data[offset + 3u] = (unsigned char)((value >> 24u) & 0xffu);
 }
 
+static int get_pe_checksum_field(const unsigned char *data, size_t size, size_t *out_offset) {
+    uint32_t nt;
+    uint16_t optional_size;
+    size_t optional;
+    uint16_t magic;
+    if (size < 0x40u || read_u16(data, size, 0u) != 0x5a4du) return 0;
+    nt = read_u32(data, size, 0x3cu);
+    if ((size_t)nt + 24u > size || memcmp(data + nt, "PE\0\0", 4u) != 0) return 0;
+    optional_size = read_u16(data, size, (size_t)nt + 20u);
+    optional = (size_t)nt + 24u;
+    if (optional_size < 68u || optional + optional_size > size) return 0;
+    magic = read_u16(data, size, optional);
+    if (magic != 0x10bu && magic != 0x20bu) return 0;
+    *out_offset = optional + 64u;
+    return 1;
+}
+
+static uint32_t compute_pe_checksum(const unsigned char *data, size_t size, size_t checksum_offset) {
+    uint64_t sum = 0u;
+    size_t offset;
+    for (offset = 0u; offset + 1u < size; offset += 2u) {
+        uint16_t word = 0u;
+        if (offset != checksum_offset && offset != checksum_offset + 2u) {
+            word = read_u16(data, size, offset);
+        }
+        sum += word;
+        sum = (sum & 0xffffu) + (sum >> 16u);
+    }
+    if (offset < size && (offset < checksum_offset || offset >= checksum_offset + 4u)) {
+        sum += data[offset];
+    }
+    while ((sum >> 16u) != 0u) sum = (sum & 0xffffu) + (sum >> 16u);
+    sum += size;
+    return (uint32_t)sum;
+}
+
+static int pe_checksum_matches(const unsigned char *data, size_t size) {
+    size_t checksum_offset;
+    uint32_t stored;
+    uint32_t expected;
+    if (!get_pe_checksum_field(data, size, &checksum_offset)) return 0;
+    stored = read_u32(data, size, checksum_offset);
+    expected = compute_pe_checksum(data, size, checksum_offset);
+    return stored != 0u && stored == expected;
+}
+
 static uint32_t align_u32(uint32_t value, uint32_t alignment) {
     return (uint32_t)(((uint64_t)value + alignment - 1u) / alignment * alignment);
 }
@@ -573,6 +619,7 @@ static int test_cli_update_preserves_resources(void) {
     CHECK(seed_pe("build/test-run/base32.exe", "build/test-run/seeded.exe") == 0);
     CHECK(system("build/engraver build/test-run/seeded.exe build/test-run/update.json build/test-run/out.exe") == 0);
     CHECK(read_file("build/test-run/out.exe", &output));
+    CHECK(pe_checksum_matches(output.data, output.size));
     CHECK(parse_resources(output.data, output.size, &list));
     resource = find_resource(&list, 10u, 77u, 1033u);
     CHECK(resource != NULL);
@@ -625,6 +672,7 @@ static int test_pe64_raw_update(void) {
     eg_resource_update_destroy(update);
     eg_release_json(document);
     CHECK(read_file("build/test-run/out64.exe", &output));
+    CHECK(pe_checksum_matches(output.data, output.size));
     CHECK(parse_resources(output.data, output.size, &list));
     resource = find_resource(&list, 24u, 1u, 1033u);
     CHECK(resource != NULL);
@@ -697,6 +745,7 @@ static int test_icon_update_preserves_existing_resource_section_virtual_size(voi
     CHECK(get_named_section_virtual_size(seeded.data, seeded.size, ".rsrc", &seeded_virtual_size));
     CHECK(write_icon_update("build/test-run/icon-large.exe", "build/test-run/icon-small.exe", small_ico, small_ico_size) == 0);
     CHECK(read_file("build/test-run/icon-small.exe", &output));
+    CHECK(pe_checksum_matches(output.data, output.size));
     CHECK(get_named_section_virtual_size(output.data, output.size, ".rsrc", &output_virtual_size));
     CHECK(output_virtual_size == seeded_virtual_size);
     CHECK(parse_resources(output.data, output.size, &list));
@@ -722,6 +771,7 @@ static int test_large_update_moves_to_new_resource_section(void) {
     memset(&output, 0, sizeof(output));
     CHECK(system("build/engraver build/test-run/seeded.exe build/test-run/big.json build/test-run/big-out.exe") == 0);
     CHECK(read_file("build/test-run/big-out.exe", &output));
+    CHECK(pe_checksum_matches(output.data, output.size));
     CHECK(parse_resources(output.data, output.size, &list));
     resource = find_resource(&list, 25u, 2u, 1033u);
     CHECK(resource != NULL);
@@ -783,6 +833,7 @@ static int test_custom_io_ops_update_flow(void) {
     result = eg_pe_write_file_with_io(&ops, file, update, "mem/out.exe");
     CHECK(result == EG_OK);
     CHECK(files[4].write_data != NULL);
+    CHECK(pe_checksum_matches(files[4].write_data, files[4].write_size));
     CHECK(parse_resources(files[4].write_data, files[4].write_size, &list));
     resource = find_resource(&list, 6u, 1u, 1033u);
     CHECK(resource != NULL);
@@ -800,6 +851,27 @@ static int test_custom_io_ops_update_flow(void) {
     free(icon.data);
     free(manifest.data);
     free(seeded.data);
+    return 0;
+}
+
+static int test_empty_update_writes_checksum(void) {
+    eg_resource_update *update = NULL;
+    eg_pe_file *file = NULL;
+    test_buffer output;
+    eg_result result;
+    memset(&output, 0, sizeof(output));
+    CHECK(create_minimal_pe("build/test-run/empty-base.exe", 0, 0x400u));
+    result = eg_resource_update_create(&update);
+    CHECK(result == EG_OK);
+    result = eg_pe_open_file("build/test-run/empty-base.exe", &file);
+    CHECK(result == EG_OK);
+    result = eg_pe_write_file(file, update, "build/test-run/empty-out.exe");
+    CHECK(result == EG_OK);
+    eg_pe_close(file);
+    eg_resource_update_destroy(update);
+    CHECK(read_file("build/test-run/empty-out.exe", &output));
+    CHECK(pe_checksum_matches(output.data, output.size));
+    free(output.data);
     return 0;
 }
 
@@ -921,6 +993,7 @@ int main(void) {
     CHECK(test_icon_update_preserves_existing_resource_section_virtual_size() == 0);
     CHECK(test_large_update_moves_to_new_resource_section() == 0);
     CHECK(test_custom_io_ops_update_flow() == 0);
+    CHECK(test_empty_update_writes_checksum() == 0);
     CHECK(test_custom_io_error_cases() == 0);
     CHECK(test_error_cases() == 0);
     return 0;
